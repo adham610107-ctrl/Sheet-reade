@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nota Pleyeri</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vexflow@4.2.5/build/cjs/vexflow.js"></script>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{background:#f4f1ea;font-family:system-ui,sans-serif}
+.hl path,.hl rect,.hl text{fill:#e11d48!important;stroke:#e11d48!important}
+#drop.over{background:#fde68a}
+</style>
+</head>
+<body class="p-3 max-w-4xl mx-auto text-stone-800">
+<h1 class="text-xl font-bold mb-2">🎼 Nota Pleyeri <span class="text-xs font-normal text-stone-500">(MusicXML / JSON / PDF·rasm → OMR backend)</span></h1>
+
+<!-- Fayl yuklash -->
+<label id="drop" class="relative block border-2 border-dashed border-stone-400 rounded-xl p-4 text-center cursor-pointer mb-3 text-sm">
+  Faylni tashlang yoki bosing<br><span class="text-xs text-stone-500">Brauzerda ishlaydi: .musicxml, .xml, .json · PDF/rasm uchun OMR backend kerak</span>
+  <input id="file" type="file" class="absolute inset-0 w-full h-full opacity-0 cursor-pointer">
+</label>
+<div id="status" class="text-xs text-stone-600 mb-2">Demo: «Quvonch madhiyasi» yuklandi.</div>
+
+<!-- Pleyer -->
+<div class="bg-white rounded-xl p-3 shadow mb-3 grid gap-3">
+  <div class="flex gap-2 flex-wrap">
+    <button id="play" class="px-4 py-2 rounded-lg bg-emerald-600 text-white">▶ Play</button>
+    <button id="pause" class="px-4 py-2 rounded-lg bg-amber-500 text-white">⏸ Pauza</button>
+    <button id="stop" class="px-4 py-2 rounded-lg bg-rose-600 text-white">⏹ Stop</button>
+    <select id="inst" class="border rounded-lg px-2">
+      <option value="piano">Fortepiano</option>
+      <option value="violin">Skripka</option>
+      <option value="flute">Fleyta</option>
+    </select>
+  </div>
+  <label class="text-sm flex items-center gap-2">BPM <input id="bpm" type="range" min="40" max="200" value="100" class="flex-1"><b id="bpmv">100</b></label>
+  <label class="text-sm flex items-center gap-2"><input id="human" type="checkbox" checked> Humanize (tabiiy tebranish)</label>
+</div>
+
+<!-- Nota ko'rinishi -->
+<div class="bg-white rounded-xl p-2 shadow overflow-x-auto"><div id="score"></div></div>
+
+<script>
+const VF = Vex.Flow;
+const $ = id => document.getElementById(id);
+
+/* ================= 1. NOTA MA'LUMOT MODELI =================
+ score = {bpm, ts:[son,maxraj], clef, measures:[[note]]}
+ note  = {k:['c/4'], d:'q', dots:0, rest:false, dyn:'mf', wedge:'<'|'>'|null, art:['s','a','fer']} */
+const BEATS = {w:4,h:2,q:1,'8':.5,'16':.25};
+const DYN = {pp:.2,p:.3,mp:.5,mf:.7,f:.9,ff:1};            // gain / velocity jadvali
+const ART = {stac:.5, legato:.95, normal:.9, fermata:2};   // davomiylik koeffitsiyentlari
+
+/* Qisqa yozuv: "e/4:q:mf:<" -> note obyekti (demo uchun) */
+function P(str){
+  return str.split(' ').map(t=>{
+    const [p,d,...fl]=t.split(':'); const n={k:[p],d:d.replace('d',''),dots:d.includes('d')?1:0,rest:p==='r',art:[],wedge:null};
+    if(n.rest) n.k=['b/4'];
+    fl.forEach(f=>{ if(DYN[f]) n.dyn=f; else if(f==='<'||f==='>') n.wedge=f; else n.art.push(f); });
+    return n;
+  });
+}
+const DEMO = {bpm:100, ts:[4,4], clef:'treble', measures:[
+  P('e/4:q:mf:< e/4:q f/4:q g/4:q'), P('g/4:q f/4:q e/4:q d/4:q'),
+  P('c/4:q:f c/4:q d/4:q e/4:q'),   P('e/4:qd:a d/4:8 d/4:h'),
+  P('e/4:q:p:s e/4:q:s f/4:q:s g/4:q:s'), P('g/4:q:< f/4:q e/4:q d/4:q'),
+  P('c/4:q:f c/4:q d/4:q e/4:q'),   P('d/4:qd d/4:8:ff c/4:h:a:fer')
+]};
+
+/* ================= 2. MusicXML PARSER ================= */
+function parseMusicXML(xmlText){
+  const doc = new DOMParser().parseFromString(xmlText,'text/xml');
+  if(doc.querySelector('parsererror')) throw new Error('XML xato');
+  const part = doc.querySelector('part'); let div=1;
+  const sc = {bpm:100, ts:[4,4], clef:'treble', measures:[]};
+  const t0 = doc.querySelector('sound[tempo]'); if(t0) sc.bpm=Math.round(+t0.getAttribute('tempo'));
+  let curDyn=null, curWedge=null;
+  part.querySelectorAll('measure').forEach(m=>{
+    const dv=m.querySelector('divisions'); if(dv) div=+dv.textContent;
+    const b=m.querySelector('time beats'), bt=m.querySelector('time beat-type');
+    if(b) sc.ts=[+b.textContent,+bt.textContent];
+    const cl=m.querySelector('clef sign'); if(cl&&cl.textContent==='F') sc.clef='bass';
+    const out=[];
+    [...m.children].forEach(el=>{
+      if(el.tagName==='direction'){
+        const d=el.querySelector('dynamics'); if(d&&d.firstElementChild) curDyn=d.firstElementChild.tagName;
+        const w=el.querySelector('wedge'); if(w){const ty=w.getAttribute('type'); curWedge=ty==='crescendo'?'<':ty==='diminuendo'?'>':null;}
+        const s=el.querySelector('sound[tempo]'); if(s) sc.bpm=Math.round(+s.getAttribute('tempo'));
+      }
+      if(el.tagName!=='note') return;
+      const key = el.querySelector('pitch') ? (()=>{const p=el.querySelector('pitch');
+        const a=+(p.querySelector('alter')?.textContent||0);
+        return p.querySelector('step').textContent.toLowerCase()+(a>0?'#':a<0?'b':'')+'/'+p.querySelector('octave').textContent;})() : 'b/4';
+      if(el.querySelector('chord') && out.length){ out[out.length-1].k.push(key); return; }
+      const type={whole:'w',half:'h',quarter:'q',eighth:'8','16th':'16'}[el.querySelector('type')?.textContent]||'q';
+      const art=[]; if(el.querySelector('staccato')) art.push('s'); if(el.querySelector('accent')) art.push('a');
+      if(el.querySelector('fermata')) art.push('fer'); if(el.querySelector('tenuto')) art.push('t');
+      const n={k:[key],d:type,dots:el.querySelectorAll('dot').length,rest:!!el.querySelector('rest'),art,dyn:curDyn,wedge:curWedge};
+      curDyn=null; curWedge=null; out.push(n);
+    });
+    sc.measures.push(out);
+  });
+  return sc;
+}
+
+/* ================= 3. VISUALIZATION (VexFlow) ================= */
+let SCORE=null, FLAT=[];           // FLAT: barcha notalar ketma-ketligi (highlight va audio uchun)
+function render(sc){
+  const host=$('score'); host.innerHTML='';
+  const perRow = innerWidth<640 ? 2 : 4, mw = Math.max(170,Math.min(260,(host.parentElement.clientWidth-30)/perRow));
+  const rows=Math.ceil(sc.measures.length/perRow), W=mw*perRow+20;
+  const r=new VF.Renderer(host,VF.Renderer.Backends.SVG); r.resize(W,rows*140+20);
+  const ctx=r.getContext(); FLAT=[]; let beatPos=0;
+  const mBeats = sc.ts[0]*4/sc.ts[1];
+  sc.measures.forEach((m,mi)=>{
+    const row=Math.floor(mi/perRow), col=mi%perRow, first=col===0;
+    const st=new VF.Stave(10+col*mw, 10+row*140, mw);
+    if(first) st.addClef(sc.clef);
+    if(mi===0) st.addTimeSignature(sc.ts[0]+'/'+sc.ts[1]);
+    st.setContext(ctx).draw();
+    const vn=m.map(n=>{
+      const dur=n.d+(n.dots?'d':'')+(n.rest?'r':'');
+      const sn=new VF.StaveNote({keys:n.k,duration:dur,clef:sc.clef,auto_stem:true});
+      n.k.forEach((k,i)=>{ const a=k.match(/^[a-g](#|b)/); if(a) sn.addModifier(new VF.Accidental(a[1]),i); });
+      if(n.dots) VF.Dot.buildAndAttach([sn],{all:true});
+      if(n.art.includes('s')) sn.addModifier(new VF.Articulation('a.').setPosition(3));
+      if(n.art.includes('a')) sn.addModifier(new VF.Articulation('a>').setPosition(3));
+      if(n.art.includes('fer')) sn.addModifier(new VF.Articulation('a@a').setPosition(3));
+      if(n.dyn) sn.addModifier(new VF.Annotation(n.dyn).setVerticalJustification(VF.Annotation.VerticalJustify.BOTTOM).setFont('serif',13,'italic bold'));
+      if(n.wedge) sn.addModifier(new VF.Annotation(n.wedge==='<'?'cresc.':'dim.').setVerticalJustification(VF.Annotation.VerticalJustify.BOTTOM).setFont('serif',11,'italic'));
+      n.beats=BEATS[n.d]*(n.dots?1.5:1); n.start=beatPos; beatPos+=n.beats; n.sn=sn; n.i=FLAT.length; FLAT.push(n);
+      return sn;
+    });
+    const v=new VF.Voice({num_beats:sc.ts[0],beat_value:sc.ts[1]}).setStrict(false).addTickables(vn);
+    new VF.Formatter().joinVoices([v]).format([v],mw-(first?70:25)-(mi===0?25:0));
+    const beams=VF.Beam.generateBeams(vn);
+    v.draw(ctx,st); beams.forEach(b=>b.setContext(ctx).draw());
+    beatPos = Math.round((mi+1)*mBeats*1000)/1000;   // taktlar orasida aniq sinxronlash
+  });
+  computeDynamics();
+}
+function highlight(i){
+  document.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl'));
+  const el=FLAT[i]?.sn.getSVGElement(); if(el){ el.classList.add('hl'); el.scrollIntoView({block:'nearest',inline:'nearest'}); }
+}
+
+/* ================= 4. DINAMIKA ALGORITMI =================
+ Har nota uchun .vel (0..1): joriy dinamika, crescendo/decrescendo bo'lsa
+ keyingi dinamikagacha chiziqli interpolyatsiya. */
+function computeDynamics(){
+  let cur=DYN.mf, i=0;
+  while(i<FLAT.length){
+    const n=FLAT[i]; if(n.dyn) cur=DYN[n.dyn]||cur;
+    if(n.wedge){
+      let j=i+1; while(j<FLAT.length && !FLAT[j].dyn) j++;
+      const target = j<FLAT.length ? DYN[FLAT[j].dyn] : (n.wedge==='<'?Math.min(1,cur+.3):Math.max(.2,cur-.3));
+      for(let k=i;k<Math.max(j,i+1);k++){ FLAT[k].vel = cur+(target-cur)*(k-i)/Math.max(1,j-i); }
+      cur=target; i=Math.max(j,i+1); if(j<FLAT.length) continue; else break;
+    }
+    n.vel=cur; i++;
+  }
+  FLAT.forEach(n=>{ if(n.vel==null) n.vel=cur; });
+}
+
+/* ================= 5. AUDIO ENGINE (Tone.js) =================
+ Eslatma: gleitz Soundfont namunalari (soundfont-player) bu sahifaning CSP'si tufayli yuklanmaydi.
+ Lokal ishga tushirsangiz Soundfont.instrument(Tone.context.rawContext,'violin') bilan
+ makeInstrument() ichidagi sintezatorni almashtirish mumkin. Hozir PolySynth timbrlari ishlatiladi. */
+let synth=null, reverb=null, started=false;
+function makeInstrument(name){
+  if(synth){ synth.releaseAll(); synth.dispose(); }
+  reverb = reverb || new Tone.Reverb({decay:2.2,wet:.2}).toDestination();
+  const cfg={
+    piano:{oscillator:{type:'triangle'},envelope:{attack:.005,decay:.6,sustain:.15,release:1.2}},
+    violin:{oscillator:{type:'sawtooth'},envelope:{attack:.12,decay:.1,sustain:.8,release:.4}},
+    flute:{oscillator:{type:'sine'},envelope:{attack:.06,decay:.1,sustain:.9,release:.2}}
+  }[name];
+  synth=new Tone.PolySynth(Tone.Synth,cfg).connect(reverb); synth.maxPolyphony=8;
+  if(name==='violin'){ const vib=new Tone.Vibrato(5.5,.12); synth.disconnect(); synth.chain(vib,reverb); }
+}
+const toTone=k=>{const m=k.match(/^([a-g])(#|b)?\/(\d)$/); return m[1].toUpperCase()+(m[2]||'')+m[3];};
+
+function schedule(){
+  Tone.Transport.cancel(); const PPQ=Tone.Transport.PPQ;
+  FLAT.forEach(n=>{
+    Tone.Transport.schedule(time=>{
+      const hum=$('human').checked, bpm=Tone.Transport.bpm.value;
+      Tone.Draw.schedule(()=>highlight(n.i),time);
+      if(n.rest) return;
+      // Articulyatsiya -> davomiylik
+      let f=ART.normal; if(n.art.includes('s')) f=ART.stac; else if(n.art.includes('t')) f=1; else f=ART.legato;
+      if(n.art.includes('fer')) f=ART.fermata;
+      // Dinamika -> velocity (gain), accent +25%
+      let vel=n.vel*(n.art.includes('a')?1.25:1);
+      let off=0; if(hum){ off=(Math.random()-.5)*.024; vel*=1+(Math.random()-.5)*.14; }
+      vel=Math.max(.05,Math.min(1,vel));
+      const sec=n.beats*60/bpm*f;
+      synth.triggerAttackRelease(n.k.map(toTone),sec,Math.max(0,time+off),vel);
+    }, Math.round(n.start*PPQ)+'i');
+  });
+  const end=FLAT.length?FLAT[FLAT.length-1].start+FLAT[FLAT.length-1].beats:0;
+  Tone.Transport.schedule(()=>stop(),Math.round(end*PPQ)+'i');
+}
+async function play(){
+  if(Tone.Transport.state==='paused'){ Tone.Transport.start(); return; }
+  await Tone.start(); makeInstrument($('inst').value); stop(true);
+  Tone.Transport.bpm.value=+$('bpm').value; schedule(); Tone.Transport.start('+0.1');
+}
+function stop(silent){ Tone.Transport.stop(); synth&&synth.releaseAll(); document.querySelectorAll('.hl').forEach(e=>e.classList.remove('hl')); }
+
+/* ================= 6. UI / FAYL YUKLASH ================= */
+const OMR_URL='http://localhost:8000/omr';   // FastAPI + Audiveris backend manzili
+function load(sc){ stop(); SCORE=sc; $('bpm').value=sc.bpm; $('bpmv').textContent=sc.bpm; Tone.Transport.bpm.value=sc.bpm; render(sc); }
+async function handleFile(f){
+  const ext=f.name.split('.').pop().toLowerCase(), st=$('status');
+  try{
+    if(['xml','musicxml'].includes(ext)){ load(parseMusicXML(await f.text())); st.textContent='MusicXML yuklandi: '+f.name; }
+    else if(ext==='json'){ load(JSON.parse(await f.text())); st.textContent='JSON yuklandi: '+f.name; }
+    else { st.textContent='OMR skanerlanmoqda…'; const fd=new FormData(); fd.append('file',f);
+      const r=await fetch(OMR_URL,{method:'POST',body:fd}); if(!r.ok) throw new Error(r.status);
+      load(parseMusicXML(await r.text())); st.textContent='OMR tayyor: '+f.name; }
+  }catch(e){ st.textContent=['pdf','png','jpg','jpeg'].includes(ext)?'PDF/rasm skaneri uchun OMR backend (Audiveris) kerak, u hozir ulanmagan. MusicXML (.musicxml/.xml) yoki .json yuklab ko\u2018ring.':'Fayl o\u2018qilmadi: '+e.message+' (siqilgan .mxl qo\u2018llab-quvvatlanmaydi, oddiy .musicxml kerak)'; }
+}
+$('file').onchange=e=>{const f=e.target.files[0]; e.target.value=''; f&&handleFile(f);};
+const dz=$('drop');
+['dragover','dragenter'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('over')}));
+dz.addEventListener('drop',e=>e.dataTransfer.files[0]&&handleFile(e.dataTransfer.files[0]));
+$('play').onclick=play; $('stop').onclick=()=>stop();
+$('pause').onclick=()=>{ if(Tone.Transport.state==='started'){Tone.Transport.pause(); synth&&synth.releaseAll();} };
+$('bpm').oninput=e=>{ $('bpmv').textContent=e.target.value; Tone.Transport.bpm.value=+e.target.value; };
+$('inst').onchange=()=>{ if(started||synth) makeInstrument($('inst').value); };
+addEventListener('resize',()=>SCORE&&render(SCORE));
+load(DEMO);
+</script>
+</body>
+</html>
